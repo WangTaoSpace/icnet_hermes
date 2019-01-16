@@ -1,0 +1,403 @@
+#!/bin/env python
+# -*- encoding:utf-8 -*-
+import paddle
+import paddle.fluid as fluid
+import numpy as np
+import sys
+import os
+import paddle.dataset as dataset
+from paddle.fluid import core
+from paddle.fluid.layers.learning_rate_scheduler import _decay_step_counter
+from paddle.fluid.initializer import init_on_cpu
+from PIL import Image
+# default parameters
+trainer_id = int(os.getenv("PADDLE_TRAINER_ID", "0"))
+trainers = int(os.getenv("PADDLE_TRAINERS_NUM", "1"))
+training_role = os.getenv("TRAINING_ROLE", "TRAINER")
+port = os.getenv("PADDLE_PORT", "6174")
+pserver_ips = os.getenv("PADDLE_PSERVERS")
+current_endpoint = str(os.getenv("POD_IP")) + ":" + port
+
+if 'ce_mode' in os.environ:  # 传入随机种子，确保一致的随机数
+    np.random.seed(10)
+    fluid.default_startup_program().random_seed = 90
+# dataset reader
+# this method is for recordio format
+# if you have other formats, try to modify it
+
+TRAIN_LIST = []
+NUM_CLASSES = 2
+TEST_DATA_SHAPE = (3, 1710, 3384)
+TRAIN_DATA_SHAPE = (1, 64,128)
+
+
+train_data_dirs = {}
+label_dirs = {}
+
+
+# label_dict = {0:0, 249:0, 255:0,
+#               200:1, 204:1, 213:1, 209:1, 206:1, 207:1,
+#               201:2, 203:2, 211:2, 208:2,
+#               216:3, 217:3, 215:3,
+#               218:4, 219:4,
+#               210:5, 232:5,
+#               214:6,
+#               202:7, 220:7, 221:7, 222:7, 231:7, 224:7, 225:7, 226:7, 230:7, 228:7, 229:7, 233:7,
+#               205:8, 212:8, 227:8, 223:8, 250:8}
+#二分类
+label_dict = {0:0, 249:0, 255:0,
+              200:1, 204:1, 213:1, 209:1, 206:1, 207:1,
+              201:1, 203:1, 211:1, 208:1,
+              216:1, 217:1, 215:1,
+              218:1, 219:1,
+              210:1, 232:1,
+              214:1,
+              202:1, 220:1, 221:1, 222:1, 231:1, 224:1, 225:1, 226:1, 230:1, 228:1, 229:1, 233:1,
+              205:1, 212:1, 227:1, 223:1, 250:1}
+class DataGenerater:
+    def __init__(self, data_list, flip=False, scaling= False ,corping= False):
+        self.flip = flip
+        self.scaling = scaling
+        self.corping = corping
+        self.image_label = []  # train is (image,label),test is (image)
+        for image_file, label_file in data_list:
+            self.image_label.append((image_file, label_file))
+
+    def create_train_reader(self):
+        """
+        Create a reader for train dataset.
+        """
+        def reader():
+            np.random.shuffle(self.image_label)   #次序打乱
+            for image, label in self.image_label:
+                image, label = self.process_train_data(image,label)
+                yield self.mask(
+                    np.array(image).astype("float32"),
+                    np.array(label).astype("float32")
+                    )
+        return reader
+
+    def process_train_data(self, image, label):
+        """
+        Process training data.
+        """
+        image, label = self.load(image, label)
+        if self.flip:
+            image, label = self.random_flip(image, label)
+        if self.scaling:
+            image, label = self.random_scaling(image, label)
+        if self.corping:
+            image, label = self.resize(image, label, out_size=TRAIN_DATA_SHAPE[1:])
+        image = dataset.image.to_chw(image)
+        return image, label
+
+    def load(self, image, label):
+        """
+        Load image from file.
+        """
+        image = Image.open(image).convert("L")
+        image = image.resize((TRAIN_DATA_SHAPE[2], TRAIN_DATA_SHAPE[1]),Image.BILINEAR)
+        image = np.array(image)
+        image = image[:,:,np.newaxis]
+        label = Image.open(label)
+        label = label.resize((TRAIN_DATA_SHAPE[2], TRAIN_DATA_SHAPE[1]),Image.BILINEAR)
+        label = np.array(label)
+        [rows, cols] = label.shape
+        for i in range(rows):
+            for j in range(cols):
+                label[i,j] = label_dict.get(label[i,j],0)    #默认值设置成255
+        return image, label
+
+    def random_flip(self, image, label):
+        """
+        Flip image and label randomly.
+        """
+        r = np.random.rand(1)
+        if r > 0.5:
+            image = dataset.image.left_right_flip(image, is_color=True)
+            label = dataset.image.left_right_flip(label, is_color=False)
+        return image, label
+
+    def mask(self,image,label):
+        """
+        Get mask for valid pixels.
+        """
+        mask0 = np.where((label == 0).flatten())[0].astype("int32")
+        mask1 = np.where((label == 1).flatten())[0].astype("int32")
+        return (image,label,label,mask0,mask1)
+
+class ResNet():
+    def __init__(self, layers=152):
+        self.layers = layers
+    def conv(self, input, k_h, k_w, c_o, s_h, s_w, biased=False, name=None):
+        act = None
+        tmp = input
+        tmp = fluid.layers.conv2d(
+            tmp,
+            num_filters=c_o,
+            filter_size=[k_h, k_w],
+            stride=[s_h, s_w],
+            groups=1,
+            act=act,
+            bias_attr=biased,
+            use_cudnn=False,
+            name=name)
+        return tmp
+    def net(self, input,num_classes,out_shape):
+        layers = self.layers
+        supported_layers = [50, 101, 152]
+        assert layers in supported_layers, \
+            "supported layers are {} but input layer is {}".format(supported_layers, layers)
+
+        if layers == 50:
+            depth = [3, 4, 6, 3]
+        elif layers == 101:
+            depth = [3, 4, 23, 3]
+        elif layers == 152:
+            depth = [3, 8, 36, 3]
+        num_filters = [64, 128, 256, 512]
+
+        conv = self.conv_bn_layer(
+            input=input, num_filters=64, filter_size=7, stride=2, act='relu')
+        conv = fluid.layers.pool2d(
+            input=conv,
+            pool_size=3,
+            pool_stride=2,
+            pool_padding=1,
+            pool_type='max')
+
+        for block in range(len(depth)):
+            for i in range(depth[block]):
+                conv = self.bottleneck_block(
+                    input=conv,
+                    num_filters=num_filters[block],
+                    stride=2 if i == 0 and block != 0 else 1)
+
+        pool = fluid.layers.pool2d(
+            input=conv, pool_size=7, pool_type='avg', global_pooling=True)
+        pool = fluid.layers.resize_bilinear(pool, out_shape=out_shape)
+        out = self.conv(
+            pool, 1, 1, num_classes, 1, 1, biased=True, name="out")
+        return out
+
+    def conv_bn_layer(self,
+                      input,
+                      num_filters,
+                      filter_size,
+                      stride=1,
+                      groups=1,
+                      act=None):
+        conv = fluid.layers.conv2d(
+            input=input,
+            num_filters=num_filters,
+            filter_size=filter_size,
+            stride=stride,
+            padding=int((filter_size-1)/2),
+            groups=groups,
+            act=None,
+            bias_attr=False)
+
+        return fluid.layers.batch_norm(input=conv, act=act)
+
+    def shortcut(self, input, ch_out, stride):
+        ch_in = input.shape[1]
+        if ch_in != ch_out or stride != 1:
+            return self.conv_bn_layer(input, ch_out, 1, stride)
+        else:
+            return input
+
+    def bottleneck_block(self, input, num_filters, stride):
+        conv0 = self.conv_bn_layer(
+            input=input, num_filters=num_filters, filter_size=1, act='relu')
+        conv1 = self.conv_bn_layer(
+            input=conv0,
+            num_filters=num_filters,
+            filter_size=3,
+            stride=stride,
+            act='relu')
+        conv2 = self.conv_bn_layer(
+            input=conv1, num_filters=num_filters * 4, filter_size=1, act=None)
+
+        short = self.shortcut(input, num_filters * 4, stride)
+
+        return fluid.layers.elementwise_add(x=short, y=conv2, act='relu')
+
+
+def resnet():
+    model = ResNet(layers=50)
+    return model
+
+def data_create():
+    def get_train_file(path):  # recursive  get data and name, return map
+        for cell in os.listdir(path):
+            if os.path.isdir(path + cell + "/"):
+                get_train_file(path + cell + "/")
+            else:
+                train_data_dirs[cell] = path + cell
+
+    def get_label_file(path):  # recursive  get data and name, return map
+        for cell in os.listdir(path):
+            if os.path.isdir(path + cell + "/"):
+                get_label_file(path + cell + "/")
+            else:
+                label_dirs[cell] = path + cell
+
+    get_train_file('./datasets/train_data/ColorImage_road02/')
+    get_train_file('./datasets/train_data/ColorImage_road03/')
+    get_train_file('./datasets/train_data/ColorImage_road04/')
+
+    get_label_file('./datasets/train_label/Label_road02/')
+    get_label_file('./datasets/train_label/Label_road03/')
+    get_label_file('./datasets/train_label/Label_road04/')
+
+    # get_test_file('/home/aistudio/data/data2492/TestSet.zip_files/ColorImage/')
+    def init_LIST():  # get train and test file_path  detail
+        for cell in train_data_dirs.keys():
+            data = train_data_dirs.get(cell)
+            label = label_dirs.get(cell.split('.')[0] + "_bin.png")
+            TRAIN_LIST.append((data, label))
+
+        print(TRAIN_LIST[0])
+
+    init_LIST()
+    train_reader = DataGenerater(TRAIN_LIST).create_train_reader()
+    return train_reader
+
+# train function
+# this method is designed for `fit a line`
+# try to update it
+batch_size = 2
+init_model = None
+k0 = 0.2
+k1 = 0.8
+POWER = 0.9
+LOG_PERIOD = 100  #
+CHECKPOINT_PERIOD = 5000  #
+LEARNING_RATE = 0.0003
+PASS_NUM = 1
+len_pass = 60
+TOTAL_STEP = PASS_NUM * len_pass
+
+no_grad_set = []
+def create_loss(predict, label, num_classes,mask):
+    print("predict",predict.shape)
+    print("label",label.shape)
+    predict = fluid.layers.transpose(predict, perm=[0, 2, 3, 1])  # (-1, 9, 180, 360) -> (-1, 180, 360, 9)
+    predict = fluid.layers.reshape(predict, shape=[-1, num_classes])
+    label = fluid.layers.reshape(label, shape=[-1, 1])
+    label = fluid.layers.cast(label, dtype="int64")
+    predict = fluid.layers.gather(predict, mask)
+    label = fluid.layers.gather(label, mask)
+    loss = fluid.layers.softmax_with_cross_entropy(predict, label)
+    no_grad_set.append(label.name)
+    return fluid.layers.reduce_mean(loss)
+
+def train(use_cuda, is_local,param_path,checkpoint_path):
+    data_shape = TRAIN_DATA_SHAPE
+    num_classes = NUM_CLASSES
+    # define network
+    image = fluid.layers.data(name='image', shape=data_shape, dtype='float32')
+    label_0 = fluid.layers.data(name='label_0', shape=[data_shape[1],data_shape[2]], dtype='int32')
+    label_1 = fluid.layers.data(name='label_1', shape=[data_shape[1],data_shape[2]], dtype='int32')
+    mask_0 = fluid.layers.data(name='mask_0', shape=[1], dtype='int32')
+    mask_1 = fluid.layers.data(name='mask_1', shape=[1], dtype='int32')
+    model = resnet()
+    predict = model.net(image,num_classes,(data_shape[1],data_shape[2]))
+    loss_0 = create_loss(predict,label_0, num_classes,mask_0)
+    loss_1 = create_loss(predict,label_1, num_classes,mask_1)
+    reduced_loss = k0*loss_0 + k1*loss_1
+
+    regularizer = fluid.regularizer.L2Decay(0.0001)
+    optimizer = fluid.optimizer.SGD(learning_rate=0.003,regularization=regularizer)
+    # optimizer = fluid.optimizer.Momentum(
+    #     learning_rate=poly_decay(), momentum=0.9, regularization=regularizer)
+    _, params_grads = optimizer.minimize(reduced_loss, no_grad_set=no_grad_set)
+
+
+    place = fluid.CUDAPlace(0) if use_cuda else fluid.CPUPlace()
+
+    if training_role == "PSERVER":
+        place = fluid.CPUPlace()
+    exe = fluid.Executor(place)
+    def train_loop(main_program):
+        """
+        train_loop
+        """
+        train_reader = paddle.batch(data_create(),
+                batch_size = batch_size)
+        feeder = fluid.DataFeeder(place=place,feed_list=[image,label_0,label_1,mask_0,mask_1])
+        exe.run(fluid.default_startup_program())
+        if init_model is not None:
+            print("load model from: %s" % init_model)
+            sys.stdout.flush()
+            fluid.io.load_params(exe, init_model)
+        for pass_id in range(PASS_NUM):
+            batch_id = 1
+            for data in train_reader():  #here train_reader is function ,so
+                #####这里添加对data数据的查看
+                results = exe.run(program= main_program,feed = feeder.feed(data), fetch_list=[reduced_loss])
+                if batch_id % LOG_PERIOD == 0:
+                    print("Pass[%d];Iter[%d]; train loss: %.3f"% (pass_id,batch_id, results[0]))
+                    sys.stdout.flush()
+
+                if batch_id % CHECKPOINT_PERIOD == 0 and checkpoint_path is not None:
+                    dir_name = checkpoint_path + "/" + str(pass_id) + "_" + str(batch_id)
+                    fluid.io.save_persistables(exe, dirname=dir_name)
+                    print("Saved checkpoint: %s" % (dir_name))
+                batch_id +=1
+
+            model_path = param_path + "/" +str(pass_id)
+            fluid.io.save_params(executor=exe, dirname=model_path, main_program=None)
+        exe.close()
+
+    if is_local:
+        print("wangtao")
+        train_loop(fluid.default_main_program())
+    else:
+        eplist = []
+        for ip in pserver_ips.split(","):
+            eplist.append(':'.join([ip, port]))
+        pserver_endpoints = ",".join(eplist)  # ip:port,ip:port...
+        print(pserver_endpoints)
+        print(trainers)
+        print(trainer_id)
+        t = fluid.DistributeTranspiler()
+        t.transpile(
+            trainer_id,
+            pservers=pserver_endpoints,
+            trainers=trainers)
+
+        if training_role == "PSERVER":
+            print("pserver")
+            pserver_prog = t.get_pserver_program(current_endpoint)
+            pserver_startup = t.get_startup_program(current_endpoint,
+                                                    pserver_prog)
+            exe.run(pserver_startup)
+            exe.run(pserver_prog)
+        elif training_role == "TRAINER":
+            print("trainer")
+            train_loop(t.get_trainer_program())
+
+
+
+# main function
+def main(use_cuda, is_local=True):
+    """
+    main
+    """
+    if use_cuda and not fluid.core.is_compiled_with_cuda():
+        return
+
+    # Directory for saving the trained model
+    param_path = "./output/model/"
+    checkpoint_path = "./datasets/checkpoint/"
+    if not os.path.isdir(param_path):
+        os.makedirs(param_path)
+    if not os.path.isdir(checkpoint_path):
+        os.makedirs(checkpoint_path)
+
+    train(use_cuda, is_local,param_path,checkpoint_path)
+
+
+if __name__ == '__main__':
+     main(False, True)
